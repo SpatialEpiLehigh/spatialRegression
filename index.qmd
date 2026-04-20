@@ -1,6 +1,6 @@
 ---
-title: "Meeting 11: Spatial Regression"
-subtitle: "GEOG 497: Spatial Epidemiology — Lehigh University"
+title: "Spatial Regression"
+subtitle: "Spatial Epidemiology — Lehigh University"
 author: "Eric Delmelle"
 date: "Spring 2026"
 format:
