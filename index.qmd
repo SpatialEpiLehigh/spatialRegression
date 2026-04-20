@@ -1,0 +1,624 @@
+---
+title: "Meeting 11: Spatial Regression"
+subtitle: "GEOG 497: Spatial Epidemiology — Lehigh University"
+author: "Eric Delmelle"
+date: "Spring 2026"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    number-sections: false
+    code-fold: true
+    code-tools: true
+    highlight-style: github
+    fig-width: 9
+    fig-height: 6
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Presentation options
+options(digits = 4, scipen = 7)
+```
+
+---
+
+## Learning Objectives
+
+By the end of this session, you will be able to:
+
+1. Explain **why OLS fails** when spatial autocorrelation is present in the residuals
+2. Distinguish between a **spatial lag model (SAR)**, a **spatial error model (SEM)**, and their extensions
+3. Use **Lagrange Multiplier tests** to choose between model specifications
+4. Fit and interpret four core spatial regression models in R
+5. Compute and explain **direct and indirect (spillover) effects** in spatial models
+6. Appreciate the implications of **spatial spillovers** for public health policy
+
+---
+
+## 1. Why Spatial Regression?
+
+In earlier sessions we tested for spatial autocorrelation using Moran's I and Local Indicators of Spatial Association (LISA). We found that health outcomes — disease rates, accessibility scores, socioeconomic exposures — are rarely spatially random. Nearby places tend to be more alike than distant places.
+
+This is not just a descriptive curiosity. When we model health outcomes using **Ordinary Least Squares (OLS)** regression, we assume that the residuals are independent across observations. That assumption almost never holds for spatial health data. Ignoring it has real consequences:
+
+- Standard errors are **biased**, leading to incorrect inference
+- Coefficients can be **inconsistent** (SAR case)
+- We may miss important **spillover effects** — mechanisms by which conditions in one place influence outcomes in neighboring places
+
+Spatial regression models explicitly account for these dependencies. Rather than being a nuisance correction, spatial structure often carries substantive meaning.
+
+### 1.1 A Running Example: Liquor Sales and Social Harm
+
+We use the **NCVACO dataset** — county-level data from North Carolina and Virginia — originally assembled by economist Mark Burkey to study the geography of alcohol markets. This dataset is analytically rich because it contains:
+
+- A plausible **outcome variable**: DUI arrests per 1,000 adults (`DUI1802`)
+- **Access measures**: distance to nearest liquor outlet (`BKGRTOABC`), distance to nearest bar (`BKGRTOMIX`)
+- **Socioeconomic covariates**: per capita income, unemployment, college enrollment, poverty
+- **Cultural variables**: % Southern Baptist (`BAPTISTSP`), % armed forces (`ARMEDP`)
+
+The spatial dimension is central: liquor market regulation varies sharply across state borders; commuting patterns connect counties; enforcement intensity may spill across county lines.
+
+::: {.callout-note}
+**Data source:** Burkey, M.L. (2010). *Geographic Access and Demand in the Market for Alcohol.* The Review of Regional Studies, 40(2), 159–179. Data available via [BurkeyAcademy's GIS & Spatial Econometrics Project](https://spatial.burkeyacademy.com/).
+:::
+
+---
+
+## 2. Data Setup
+
+
+```{r load-packages}
+library(sf)
+library(spdep)
+library(spatialreg)
+library(tidyverse)
+library(tmap)
+library(knitr)
+library(kableExtra)
+```
+
+```{r load-data}
+# Load the NCVACO dataset bundled with spatialreg
+data("boston", package = "spatialreg")  # placeholder check
+data("nc.sids", package = "spData", envir = environment())
+
+# The NCVACO data is distributed with the spdep package as a shapefile
+# We load it directly from the package
+nc_path <- system.file("shapes/columbus.shp", package = "spData")
+
+# Use Columbus Ohio crime data (bundled, similar structure) as a 
+# self-contained teaching substitute — same model family, clean reproducibility
+columbus <- st_read(system.file("shapes/columbus.shp", package = "spData"),
+                    quiet = TRUE)
+```
+
+::: {.callout-tip}
+**Self-contained reproducibility:** This document uses the `columbus` dataset bundled with the `spData` package — no external file downloads required. The Columbus dataset contains neighborhood-level crime, income, and housing data for Columbus, Ohio, and is a classic benchmark in spatial econometrics. The same model logic applies directly to the NCVACO alcohol dataset or any county-level health outcome data.
+:::
+
+### 2.1 Variable Overview
+
+The Columbus dataset contains 49 neighborhoods with the following key variables:
+
+| Variable | Description |
+|----------|-------------|
+| `CRIME`  | Residential burglaries and vehicle thefts per 1,000 households |
+| `INC`    | Household income (in $1,000s) |
+| `HOVAL`  | Housing value (in $1,000s) |
+| `OPEN`   | Open space in neighborhood |
+| `PLUMB`  | % housing units without plumbing |
+| `DISCBD` | Distance to Central Business District |
+
+```{r data-summary}
+columbus |>
+  st_drop_geometry() |>
+  select(CRIME, INC, HOVAL, OPEN, PLUMB, DISCBD) |>
+  summary() |>
+  kable(caption = "Summary statistics: Columbus neighborhood dataset") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### 2.2 Spatial Distribution of Crime
+
+```{r map-crime}
+#| fig-cap: "Residential crime rate by neighborhood, Columbus, Ohio."
+
+tmap_mode("plot")
+
+tm_shape(columbus) +
+  tm_fill("CRIME",
+          style = "quantile",
+          n = 5,
+          palette = "YlOrRd",
+          title = "Crime per 1,000 HH") +
+  tm_borders(col = "white", lwd = 0.5) +
+  tm_layout(
+    main.title = "Residential Crime, Columbus OH",
+    main.title.size = 1,
+    legend.outside = FALSE,
+    frame = FALSE
+  )
+```
+
+---
+
+## 3. Constructing Spatial Weights
+
+Before fitting any spatial model, we need to define **who is a neighbor** of whom, and how to weight those relationships.
+
+### 3.1 Queen Contiguity
+
+Two polygons are **queen contiguous** if they share any boundary point (including corners). This is the most common choice for areal data.
+
+```{r weights}
+# Queen contiguity neighbor list
+queen_nb <- poly2nb(columbus, queen = TRUE)
+
+# Rook contiguity (shared edges only, no corners)
+rook_nb <- poly2nb(columbus, queen = FALSE)
+
+# Convert to row-standardized listw object
+queen_listw <- nb2listw(queen_nb, style = "W")
+rook_listw  <- nb2listw(rook_nb,  style = "W")
+
+# Summary
+summary(queen_nb)
+```
+
+::: {.callout-note}
+**Row standardization (`style = "W"`)** means each row of the weights matrix sums to 1. This makes the spatial lag $\mathbf{Wy}$ interpretable as a **local average** of neighbors' values — convenient for interpretation but it does change the scale of $\rho$.
+:::
+
+### 3.2 Symmetry Check
+
+```{r symmetry}
+is.symmetric.nb(queen_nb)
+is.symmetric.nb(rook_nb)
+```
+
+Both contiguity structures are symmetric: if A is a neighbor of B, then B is a neighbor of A. This is a prerequisite for many spatial regression estimators.
+
+### 3.3 Visualizing the Neighbor Network
+
+```{r plot-neighbors}
+#| fig-cap: "Queen contiguity neighbor links overlaid on Columbus neighborhoods."
+#| fig-height: 5
+
+# Get centroids for plotting
+coords <- st_centroid(st_geometry(columbus))
+
+plot(st_geometry(columbus), border = "grey70", col = "grey95",
+     main = "Queen Contiguity Neighbor Network")
+plot(queen_nb, coords, add = TRUE, col = "#2196F3", lwd = 0.8)
+```
+
+---
+
+## 4. Testing for Spatial Autocorrelation
+
+Before choosing a spatial model, we should confirm that spatial autocorrelation is actually present in our outcome and, after OLS, in our residuals.
+
+### 4.1 Moran's I on the Outcome
+
+```{r morans-i-outcome}
+moran_crime <- moran.test(columbus$CRIME, listw = queen_listw)
+moran_crime
+```
+
+```{r morans-i-display}
+cat(sprintf(
+  "Moran's I = %.4f  |  p-value = %.4e\n",
+  moran_crime$estimate["Moran I statistic"],
+  moran_crime$p.value
+))
+```
+
+A positive, significant Moran's I confirms spatial clustering in the crime rate — high-crime neighborhoods tend to be surrounded by other high-crime neighborhoods.
+
+---
+
+## 5. The Four Core Spatial Regression Models
+
+All spatial regression models in the classical framework begin from a standard linear specification and then add spatial structure. We define our regression equation once:
+
+$$\text{CRIME}_i = \beta_0 + \beta_1 \cdot \text{INC}_i + \beta_2 \cdot \text{HOVAL}_i + \varepsilon_i$$
+
+```{r reg-equation}
+reg_eq <- CRIME ~ INC + HOVAL
+```
+
+### 5.1 Model 1: OLS (Baseline)
+
+OLS is our benchmark. We estimate it first, then test whether its residuals are spatially autocorrelated.
+
+```{r ols}
+reg1 <- lm(reg_eq, data = columbus)
+summary(reg1)
+```
+
+**Residual spatial autocorrelation test:**
+
+```{r ols-moran}
+lm_moran <- lm.morantest(reg1, listw = queen_listw)
+lm_moran
+```
+
+Significant residual autocorrelation confirms that OLS is misspecified — something spatial is going on that our covariates do not capture.
+
+```{r ols-resid-map}
+#| fig-cap: "OLS residuals mapped across Columbus neighborhoods. Spatial clustering of positive and negative residuals is visible, confirming the Moran's I result."
+
+columbus$resid_ols <- residuals(reg1)
+
+tm_shape(columbus) +
+  tm_fill("resid_ols",
+          style = "jenks", n = 5,
+          palette = "RdBu", midpoint = 0,
+          title = "OLS residuals") +
+  tm_borders(col = "white", lwd = 0.5) +
+  tm_layout(
+    main.title = "OLS Residuals",
+    main.title.size = 1,
+    frame = FALSE,
+    legend.outside = FALSE
+  )
+```
+
+### 5.2 Model Selection via LM Tests
+
+The **Lagrange Multiplier (LM) tests** are the standard decision tool for choosing between a spatial lag and a spatial error specification.
+
+```{r lm-tests}
+lm_tests <- lm.LMtests(reg1, queen_listw,
+                        test = c("LMerr", "LMlag", "RLMerr", "RLMlag", "SARMA"))
+summary(lm_tests)
+```
+
+::: {.callout-important}
+**Decision rule (Anselin 1988):**
+
+1. If only **LMlag** is significant → use SAR (spatial lag model)
+2. If only **LMerr** is significant → use SEM (spatial error model)  
+3. If both are significant → compare the **robust versions** (RLMlag vs. RLMerr); choose the one with the smaller p-value
+4. If neither is significant → OLS may be adequate
+:::
+
+```{r lm-decision}
+# Extract p-values for decision display
+lm_df <- data.frame(
+  Test = c("LM Error", "LM Lag", "Robust LM Error", "Robust LM Lag", "SARMA"),
+  Statistic = sapply(lm_tests, function(x) x$statistic),
+  `p-value`  = sapply(lm_tests, function(x) x$p.value),
+  check.names = FALSE
+)
+
+lm_df |>
+  mutate(`p-value` = ifelse(`p-value` < 0.001, "< 0.001", round(`p-value`, 4))) |>
+  kable(caption = "Lagrange Multiplier test results for spatial model selection",
+        digits = 3) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### 5.3 Model 2: SLX — Spatially Lagged X
+
+The **SLX model** adds spatially lagged versions of the predictors (but not of the outcome):
+
+$$y = X\boldsymbol{\beta} + WX\boldsymbol{\theta} + \varepsilon$$
+
+This is the simplest way to capture **local spillovers**: the crime rate in neighborhood $i$ is affected not just by income in $i$, but also by average income among $i$'s neighbors.
+
+```{r slx}
+reg2 <- lmSLX(reg_eq, data = columbus, listw = queen_listw)
+summary(reg2)
+```
+
+**Direct and indirect effects** (total impact accounting for spatial lags):
+
+```{r slx-impacts}
+impacts_slx <- impacts(reg2, listw = queen_listw)
+summary(impacts(reg2, listw = queen_listw, R = 500), zstats = TRUE)
+```
+
+::: {.callout-note}
+**Interpreting impacts in the SLX model:**
+
+- **Direct effect**: the effect of a unit change in $X_i$ on $y_i$
+- **Indirect effect**: the effect of a unit change in neighbors' $X$ on $y_i$ (the spillover)
+- **Total effect**: direct + indirect
+:::
+
+### 5.4 Model 3: SAR — Spatial Autoregressive (Lag) Model
+
+The **SAR model** (also called the spatial lag model) includes a spatially lagged dependent variable:
+
+$$y = \rho W y + X\boldsymbol{\beta} + \varepsilon$$
+
+The parameter $\rho$ (rho) captures **global spatial dependence**: how much a neighborhood's crime rate is influenced by its neighbors' crime rates, above and beyond observed covariates. Think of it as capturing contagion, diffusion, or spillover in the outcome itself.
+
+```{r sar}
+reg3 <- lagsarlm(reg_eq, data = columbus, listw = queen_listw)
+summary(reg3)
+```
+
+::: {.callout-warning}
+**Critical point:** In the SAR model, the $\beta$ coefficients **cannot be interpreted as marginal effects**. Because $y$ appears on both sides of the equation, a change in $X_i$ triggers a chain reaction through the whole network. You must use the `impacts()` function to recover interpretable effects.
+:::
+
+```{r sar-impacts}
+summary(impacts(reg3, listw = queen_listw, R = 500), zstats = TRUE)
+```
+
+### 5.5 Model 4: SEM — Spatial Error Model
+
+The **SEM** models spatial dependence in the **error term** rather than in the outcome:
+
+$$y = X\boldsymbol{\beta} + u, \quad u = \lambda W u + \varepsilon$$
+
+Here $\lambda$ (lambda) captures spatial correlation in the unmeasured factors that drive outcomes. The SEM treats spatial autocorrelation as a **nuisance** — something to correct for, rather than a substantive spillover to estimate. Coefficients retain their standard marginal effect interpretation.
+
+```{r sem}
+reg4 <- errorsarlm(reg_eq, data = columbus, listw = queen_listw)
+summary(reg4)
+```
+
+**Spatial Hausman Test** — tests whether the spatial error structure is misspecified (i.e., whether OLS would have been consistent):
+
+```{r hausman}
+hausman <- Hausman.test(reg4)
+hausman
+```
+
+A significant Hausman test suggests the SEM is preferred over OLS. See [Pace & LeSage (2008)](https://www.sciencedirect.com/science/article/abs/pii/S016517650800270X) for technical details.
+
+---
+
+## 6. Extended Models: The Modern Approach
+
+### 6.1 Model 5: SDM — Spatial Durbin Model
+
+The **SDM** adds spatially lagged $X$ to the SAR model:
+
+$$y = \rho W y + X\boldsymbol{\beta} + WX\boldsymbol{\theta} + \varepsilon$$
+
+The SDM nests both SAR and SLX as special cases. It is often preferred when theory suggests both global contagion *and* local covariate spillovers.
+
+```{r sdm}
+reg5 <- lagsarlm(reg_eq, data = columbus, listw = queen_listw, type = "mixed")
+summary(reg5)
+```
+
+```{r sdm-impacts}
+impacts_sdm <- impacts(reg5, listw = queen_listw)
+summary(impacts(reg5, listw = queen_listw, R = 500), zstats = TRUE)
+```
+
+### 6.2 Model 6: SDEM — Spatial Durbin Error Model
+
+The **SDEM** adds spatially lagged $X$ to the SEM:
+
+$$y = X\boldsymbol{\beta} + WX\boldsymbol{\theta} + u, \quad u = \lambda W u + \varepsilon$$
+
+The SDEM is useful when you believe spillovers are **local** (captured by $WX$) but the error structure is globally autocorrelated.
+
+```{r sdem}
+reg6 <- errorsarlm(reg_eq, data = columbus, listw = queen_listw, etype = "emixed")
+summary(reg6)
+```
+
+```{r sdem-impacts}
+summary(impacts(reg6, listw = queen_listw, R = 500), zstats = TRUE)
+```
+
+### 6.3 Model 7: SARAR (SAC / Kelejian-Prucha)
+
+The **SARAR** model includes both a spatial lag in $y$ and a spatial lag in the error:
+
+$$y = \rho W y + X\boldsymbol{\beta} + u, \quad u = \lambda W u + \varepsilon$$
+
+This is the most general model in this family and is also called the **SAC** or **Cliff-Ord** model.
+
+```{r sarar}
+reg7 <- sacsarlm(reg_eq, data = columbus, listw = queen_listw, type = "sac")
+summary(reg7)
+```
+
+```{r sarar-impacts}
+impacts(reg7, listw = queen_listw)
+```
+
+---
+
+## 7. Model Comparison
+
+### 7.1 Coefficient Summary Table
+
+```{r model-table}
+# Extract key statistics from each model
+model_stats <- data.frame(
+  Model = c("OLS", "SLX", "SAR", "SEM", "SDM", "SDEM", "SARAR"),
+  AIC   = c(AIC(reg1), AIC(reg2), AIC(reg3), AIC(reg4), AIC(reg5), AIC(reg6), AIC(reg7)),
+  LogLik = c(logLik(reg1), logLik(reg2), logLik(reg3), logLik(reg4),
+             logLik(reg5), logLik(reg6), logLik(reg7))
+)
+
+model_stats |>
+  arrange(AIC) |>
+  mutate(AIC    = round(AIC, 2),
+         LogLik = round(LogLik, 2)) |>
+  kable(caption = "Model comparison: AIC and log-likelihood",
+        col.names = c("Model", "AIC", "Log-Likelihood")) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) |>
+  row_spec(1, bold = TRUE, background = "#e8f5e9")
+```
+
+::: {.callout-note}
+**AIC interpretation:** Lower AIC = better fit. The highlighted row is the best-fitting model. Note that AIC comparisons are only valid across models estimated on the same data; the spatial models are estimated by maximum likelihood while OLS uses least squares.
+:::
+
+### 7.2 Residual Maps
+
+Mapping residuals is an essential diagnostic — even after fitting spatial models, we should check whether unexplained spatial structure remains.
+
+```{r residual-maps}
+#| fig-cap: "OLS vs. SAR residuals — note the reduction in spatial clustering in the SAR model."
+#| fig-height: 5
+
+columbus$resid_ols <- residuals(reg1)
+columbus$resid_sar <- residuals(reg3)
+
+p_ols <- tm_shape(columbus) +
+  tm_fill("resid_ols",
+          style = "jenks", n = 5,
+          palette = "RdBu", midpoint = 0,
+          title = "OLS residuals") +
+  tm_borders(col = "white", lwd = 0.4) +
+  tm_layout(main.title = "OLS", main.title.size = 0.9, frame = FALSE,
+            legend.outside = FALSE)
+
+p_sar <- tm_shape(columbus) +
+  tm_fill("resid_sar",
+          style = "jenks", n = 5,
+          palette = "RdBu", midpoint = 0,
+          title = "SAR residuals") +
+  tm_borders(col = "white", lwd = 0.4) +
+  tm_layout(main.title = "SAR", main.title.size = 0.9, frame = FALSE,
+            legend.outside = FALSE)
+
+tmap_arrange(p_ols, p_sar, ncol = 2)
+```
+
+**Residual Moran's I comparison:**
+
+```{r resid-moran}
+moran_ols_resid <- moran.test(residuals(reg1), listw = queen_listw)
+moran_sar_resid <- moran.test(residuals(reg3), listw = queen_listw)
+
+cat("OLS residuals — Moran's I:", round(moran_ols_resid$estimate[1], 4),
+    "  p =", round(moran_ols_resid$p.value, 4), "\n")
+cat("SAR residuals — Moran's I:", round(moran_sar_resid$estimate[1], 4),
+    "  p =", round(moran_sar_resid$p.value, 4), "\n")
+```
+
+---
+
+## 8. Understanding Spillover Effects
+
+One of the most important — and often overlooked — aspects of spatial regression is the distinction between **direct** and **indirect effects**.
+
+### 8.1 The Feedback Problem
+
+In the SAR model, a change in income in neighborhood A affects:
+
+1. Crime in A directly (direct effect)
+2. Crime in A's neighbors (first-order spillover)
+3. Crime in A's neighbors' neighbors — because they are affected by A's neighbors (second-order spillover)
+4. Eventually, crime in A itself — because A is affected by its neighbors, who are now affected (feedback effect)
+
+This is why simple $\beta$ coefficients in the SAR model are uninterpretable. The `impacts()` function from `spatialreg` computes the full decomposition.
+
+### 8.2 Visualizing the Impact Decomposition
+
+```{r impact-viz}
+#| fig-cap: "Direct vs. indirect effects for the SAR model. Indirect (spillover) effects can be substantial."
+
+impacts_sar <- impacts(reg3, listw = queen_listw, R = 500)
+
+varnames <- attr(impacts_sar, "bnames")
+direct   <- as.numeric(impacts_sar$res$direct)
+indirect <- as.numeric(impacts_sar$res$indirect)
+total    <- as.numeric(impacts_sar$res$total)
+
+imp_df <- data.frame(
+  Variable = factor(rep(varnames, 3)),
+  Effect   = rep(c("Direct", "Indirect", "Total"), each = length(varnames)),
+  Estimate = c(direct, indirect, total)
+)
+
+ggplot(imp_df, aes(x = Variable, y = Estimate, fill = Effect)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_fill_manual(values = c("Direct" = "#1976D2", "Indirect" = "#E64A19", "Total" = "#388E3C")) +
+  labs(title = "SAR Model: Direct, Indirect, and Total Effects",
+       x = NULL, y = "Effect on Crime Rate",
+       fill = "Effect type") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+---
+
+## 9. Conceptual Map of Spatial Models
+
+The seven models we have covered can be organized along two dimensions:
+
+| | **No spatial lag in $y$** | **Spatial lag in $y$ ($\rho Wy$)** |
+|---|---|---|
+| **No lag in $X$ or $u$** | OLS | SAR |
+| **Lag in $X$ only** | SLX | SDM |
+| **Lag in $u$ only** | SEM | SARAR |
+| **Lag in $X$ and $u$** | SDEM | Manski (all-inclusive) |
+
+Choosing among them is primarily a **theoretical** question — what do you believe is the data-generating process? — with LM tests as a useful empirical guide when theory is ambiguous.
+
+---
+
+## 10. Exercises
+
+::: {.callout-tip}
+### Exercise 10.1 — Reproducing the LM Decision Rule
+
+Run the full sequence: OLS → `lm.morantest()` → `lm.LMtests()` for the Columbus dataset. Based on the robust LM test results, which model would you select? Does your choice match the AIC ranking you produced in Section 7.1?
+:::
+
+::: {.callout-tip}
+### Exercise 10.2 — Comparing Contiguity Structures
+
+Re-fit the SAR model using **rook** contiguity (`rook_listw`) instead of queen. Compare:
+
+- The estimated $\rho$
+- The direct and indirect effects
+- The model AIC
+
+What does this sensitivity tell you about the importance of the weights matrix choice?
+:::
+
+::: {.callout-tip}
+### Exercise 10.3 — Spillover Interpretation
+
+Using the SDM impacts output, interpret the **indirect effect** of `INC` (household income). Write 2–3 sentences suitable for inclusion in a policy brief: what does the spillover mean in plain language, and what policy implication might follow?
+:::
+
+
+
+---
+
+## 11. Discussion Questions
+
+1. **Theory before models**: A colleague says, "I'll just run all eight models and pick the one with the best AIC." What is the problem with this approach, and what should guide model selection instead?
+
+2. **Spillovers and policy**: You find a significant *indirect* effect of neighborhood poverty on crime, meaning high poverty in one area increases crime in *neighboring* areas. What does this imply for place-based policy interventions (e.g., targeted poverty reduction in one neighborhood)?
+
+3. **The weights matrix as a model assumption**: We treated queen contiguity as given, but spatial weights encode a theoretical claim about the nature of spatial interaction. What alternative weight structures might make sense for studying (a) infectious disease transmission, (b) alcohol availability and harm, (c) emergency response times?
+
+4. **Spatial error vs. spatial lag**: In a study of opioid overdose deaths at the county level, would you expect spatial dependence to manifest more in the *outcome* (SAR) or in the *error* (SEM)? What mechanisms would drive each?
+
+---
+
+## References
+
+- Anselin, L. (1988). *Spatial Econometrics: Methods and Models.* Dordrecht: Kluwer Academic.
+- Anselin, L. (2003). Spatial externalities, spatial multipliers, and spatial econometrics. *International Regional Science Review*, 26(2), 153–166.
+- Burkey, M.L. (2010). Geographic Access and Demand in the Market for Alcohol. *The Review of Regional Studies*, 40(2), 159–179.
+- LeSage, J.P. & Pace, R.K. (2009). *Introduction to Spatial Econometrics.* Boca Raton: CRC Press.
+- Pace, R.K. & LeSage, J.P. (2008). A spatial Hausman test. *Economics Letters*, 101(3), 282–284.
+- Ward, M.D. & Gleditsch, K.S. (2008). *Spatial Regression Models.* Thousand Oaks: SAGE.
