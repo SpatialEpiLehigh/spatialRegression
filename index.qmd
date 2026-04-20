@@ -263,7 +263,7 @@ columbus$resid_ols <- residuals(reg1)
 tm_shape(columbus) +
   tm_fill("resid_ols",
           style = "jenks", n = 5,
-          palette = "RdBu", midpoint = 0,
+          palette = "RdYlGn", midpoint = 0,
           title = "OLS residuals") +
   tm_borders(col = "white", lwd = 0.5) +
   tm_layout(
@@ -384,7 +384,7 @@ A significant Hausman test suggests the SEM is preferred over OLS. See [Pace & L
 
 ## 6. Extended Models: The Modern Approach
 
-### 6.1 Model 5: SDM — Spatial Durbin Model
+### Model 5: SDM — Spatial Durbin Model
 
 The **SDM** adds spatially lagged $X$ to the SAR model:
 
@@ -402,70 +402,9 @@ impacts_sdm <- impacts(reg5, listw = queen_listw)
 summary(impacts(reg5, listw = queen_listw, R = 500), zstats = TRUE)
 ```
 
-### 6.2 Model 6: SDEM — Spatial Durbin Error Model
 
-The **SDEM** adds spatially lagged $X$ to the SEM:
 
-$$y = X\boldsymbol{\beta} + WX\boldsymbol{\theta} + u, \quad u = \lambda W u + \varepsilon$$
-
-The SDEM is useful when you believe spillovers are **local** (captured by $WX$) but the error structure is globally autocorrelated.
-
-```{r sdem}
-reg6 <- errorsarlm(reg_eq, data = columbus, listw = queen_listw, etype = "emixed")
-summary(reg6)
-```
-
-```{r sdem-impacts}
-summary(impacts(reg6, listw = queen_listw, R = 500), zstats = TRUE)
-```
-
-### 6.3 Model 7: SARAR (SAC / Kelejian-Prucha)
-
-The **SARAR** model includes both a spatial lag in $y$ and a spatial lag in the error:
-
-$$y = \rho W y + X\boldsymbol{\beta} + u, \quad u = \lambda W u + \varepsilon$$
-
-This is the most general model in this family and is also called the **SAC** or **Cliff-Ord** model.
-
-```{r sarar}
-reg7 <- sacsarlm(reg_eq, data = columbus, listw = queen_listw, type = "sac")
-summary(reg7)
-```
-
-```{r sarar-impacts}
-impacts(reg7, listw = queen_listw)
-```
-
----
-
-## 7. Model Comparison
-
-### 7.1 Coefficient Summary Table
-
-```{r model-table}
-# Extract key statistics from each model
-model_stats <- data.frame(
-  Model = c("OLS", "SLX", "SAR", "SEM", "SDM", "SDEM", "SARAR"),
-  AIC   = c(AIC(reg1), AIC(reg2), AIC(reg3), AIC(reg4), AIC(reg5), AIC(reg6), AIC(reg7)),
-  LogLik = c(logLik(reg1), logLik(reg2), logLik(reg3), logLik(reg4),
-             logLik(reg5), logLik(reg6), logLik(reg7))
-)
-
-model_stats |>
-  arrange(AIC) |>
-  mutate(AIC    = round(AIC, 2),
-         LogLik = round(LogLik, 2)) |>
-  kable(caption = "Model comparison: AIC and log-likelihood",
-        col.names = c("Model", "AIC", "Log-Likelihood")) |>
-  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) |>
-  row_spec(1, bold = TRUE, background = "#e8f5e9")
-```
-
-::: {.callout-note}
-**AIC interpretation:** Lower AIC = better fit. The highlighted row is the best-fitting model. Note that AIC comparisons are only valid across models estimated on the same data; the spatial models are estimated by maximum likelihood while OLS uses least squares.
-:::
-
-### 7.2 Residual Maps
+### 7 Residual Maps
 
 Mapping residuals is an essential diagnostic — even after fitting spatial models, we should check whether unexplained spatial structure remains.
 
@@ -479,7 +418,7 @@ columbus$resid_sar <- residuals(reg3)
 p_ols <- tm_shape(columbus) +
   tm_fill("resid_ols",
           style = "jenks", n = 5,
-          palette = "RdBu", midpoint = 0,
+          palette = "RdYlGn", midpoint = 0,
           title = "OLS residuals") +
   tm_borders(col = "white", lwd = 0.4) +
   tm_layout(main.title = "OLS", main.title.size = 0.9, frame = FALSE,
@@ -488,7 +427,7 @@ p_ols <- tm_shape(columbus) +
 p_sar <- tm_shape(columbus) +
   tm_fill("resid_sar",
           style = "jenks", n = 5,
-          palette = "RdBu", midpoint = 0,
+          palette = "RdYlGn", midpoint = 0,
           title = "SAR residuals") +
   tm_borders(col = "white", lwd = 0.4) +
   tm_layout(main.title = "SAR", main.title.size = 0.9, frame = FALSE,
